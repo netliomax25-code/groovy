@@ -372,12 +372,8 @@ public class IndyInterface {
         }
 
         if (mhw.isCanSetTarget() && (callSite.getTarget() != mhw.getTargetMethodHandle())) {
-            // GROOVY-11935: Set invokedynamic call site target immediately to enable earlier JIT inlining.
-            if (callSite.type().parameterType(0) == Class.class) {
-                var method = mhw.getMethod();
-                if (method != null && Modifier.isStatic(method.getModifiers())) {
-                    callSite.setTarget(mhw.getTargetMethodHandle());
-                }
+            if (shouldSetCallSiteTargetEarly(callSite, mhw, receiver)) {
+                callSite.setTarget(mhw.getTargetMethodHandle());
             }
 
             if (mhw.getLatestHitCount() > INDY_OPTIMIZE_THRESHOLD) {
@@ -398,6 +394,53 @@ public class IndyInterface {
         }
 
         return mhw.getCachedMethodHandle();
+    }
+
+    /**
+     * GROOVY-11935: install direct-looking targets early when the receiver shape is already
+     * specific enough to make earlier JIT inlining worthwhile.
+     *
+     * <p>Three cases trigger early relinking (in priority order):
+     * <ol>
+     *   <li><b>Private method (static or instance)</b> — non-overridable by definition; the
+     *       dispatch target is uniquely determined regardless of the call-site receiver type,
+     *       so relinking is safe on the very first hit.</li>
+     *   <li><b>Static call on a {@code Class} receiver</b> — the dispatch target
+     *       is fully determined by the declared call-site type; relink on first hit.</li>
+     *   <li><b>Final receiver type</b> — the JVM verifier guarantees that any non-null,
+     *       non-{@code Class} object reaching a call site whose static parameter type is a
+     *       {@code final} class is exactly that class (no subclass can exist). The runtime
+     *       type therefore needs no separate equality check; one repeated hit is still
+     *       required to avoid thrashing cold sites.</li>
+     * </ol>
+     */
+    private static boolean shouldSetCallSiteTargetEarly(CacheableCallSite callSite, MethodHandleWrapper mhw, Object receiver) {
+        var method = mhw.getMethod();
+        if (method == null) return false;
+        int modifiers = method.getModifiers();
+
+        // Private method (static or instance): non-overridable; the target is uniquely determined
+        // and cannot change through subclassing, so relinking is safe on the very first hit.
+        if (Modifier.isPrivate(modifiers)) return true;
+
+        // Static call: stable only when the call-site declared type is Class,
+        // because that is the only shape where the dispatch target is fully determined by the
+        // declared type alone (different Class objects yield different static-method targets).
+        Class<?> receiverType = callSite.type().parameterType(0);
+        if (Modifier.isStatic(modifiers)) return receiverType == Class.class;
+
+        // Require at least one repeated hit for non-private, non-static sites to filter cold invocations.
+        if (mhw.getLatestHitCount() == 0) return false;
+
+        // Null and Class<?> receivers must be excluded: null has no verifier-enforced type, and a Class<?> instance
+        // used as an instance-method receiver dispatches through Class metaclass machinery — neither maps
+        // cleanly to the declared receiverType, so early relinking would corrupt future invocations.
+        if (receiver == null || receiver instanceof Class<?>) return false;
+
+        // Final receiver type: a final class has no subclasses, relinking is safe as soon as the site is locally warm
+        // (latestHitCount > 0, enforced above), because the dispatch target can never change due
+        // to a receiver-type shift.
+        return Modifier.isFinal(receiverType.getModifiers());
     }
 
     /**
